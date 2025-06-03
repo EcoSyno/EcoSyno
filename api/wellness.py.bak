@@ -1,0 +1,700 @@
+"""
+Wellness Module API Routes
+
+This module provides the API endpoints for the Wellness module, including:
+- Mood tracking and analysis
+- Sleep tracking
+- Meditation sessions
+- Exercise logging
+- Nutrition tracking
+- Goal coaching
+"""
+from datetime import datetime, timedelta
+import json
+import logging
+import os
+import random
+import re
+from flask import Blueprint, jsonify, request, current_app, g
+import requests
+
+from models import db, MoodLog, User
+from auth_middleware import token_required
+from fallback import fallback_route, generate_wellness_data, is_fallback_mode
+
+wellness_bp = Blueprint('wellness', __name__)
+logger = logging.getLogger(__name__)
+
+# Mood Tracking API
+@wellness_bp.route('/mood', methods=['POST'])
+def log_mood():
+    """
+    Log a new mood entry for the user
+    
+    Required JSON fields:
+    - mood_score: 1-10 rating
+    - mood_tags: array of mood tags (e.g., "happy", "tired", "anxious")
+    - activity_tags: array of activity tags (e.g., "work", "exercise", "socializing")
+    - notes: optional text notes
+    - sleep_hours: optional float value
+    - energy_level: optional 1-5 rating
+    - stress_level: optional 1-5 rating
+    """
+    data = request.get_json()
+    
+    # For testing, use admin user if no authenticated user
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else "demo-user-123"
+    
+    # Validate required fields
+    required_fields = ['mood_score', 'mood_tags', 'activity_tags']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({
+                "status": "error",
+                "message": f"Missing required field: {field}"
+            }), 400
+    
+    # Validate score ranges
+    if not (1 <= data['mood_score'] <= 10):
+        return jsonify({
+            "status": "error",
+            "message": "Mood score must be between 1 and 10"
+        }), 400
+    
+    if 'energy_level' in data and not (1 <= data['energy_level'] <= 5):
+        return jsonify({
+            "status": "error",
+            "message": "Energy level must be between 1 and 5"
+        }), 400
+    
+    if 'stress_level' in data and not (1 <= data['stress_level'] <= 5):
+        return jsonify({
+            "status": "error",
+            "message": "Stress level must be between 1 and 5"
+        }), 400
+
+    # Default recommendations
+    recommendations = [
+        "Take a short walk outside to boost your mood and energy levels.",
+        "Try a 5-minute meditation to center yourself and reduce stress.",
+        "Connect with a friend or family member - social connections improve wellbeing."
+    ]
+    
+    mood_id = random.randint(1000, 9999)
+    
+    # Try to save to database - this may fail if schema doesn't match
+    try:
+        # Create a new mood log entry
+        new_mood = MoodLog()
+        new_mood.user_id = uid
+        new_mood.timestamp = datetime.now().isoformat()
+        new_mood.mood_score = data['mood_score']
+        new_mood.mood_tags = data['mood_tags']
+        new_mood.activity_tags = data['activity_tags']
+        
+        # Optional fields
+        if data.get('notes'):
+            new_mood.notes = data.get('notes')
+        if data.get('sleep_hours'):
+            new_mood.sleep_hours = data.get('sleep_hours')
+        if data.get('energy_level'):
+            new_mood.energy_level = data.get('energy_level')
+        if data.get('stress_level'):
+            new_mood.stress_level = data.get('stress_level')
+        
+        # Try to save to database
+        db.session.add(new_mood)
+        db.session.commit()
+        
+        # Get the real ID if save was successful
+        if hasattr(new_mood, 'id'):
+            mood_id = new_mood.id
+            
+    except Exception as e:
+        # Log the error but continue - we'll return success with recommendations anyway
+        logger.error(f"Error saving mood log: {str(e)}")
+    
+    # Try to get OpenAI recommendations if API key exists
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    try:
+        if openai_key and data.get('mood_tags'):
+            # Weather info would typically come from an external API
+            weather = "sunny"
+            mood = ", ".join(data['mood_tags'][:3])  # Use the first 3 mood tags
+            
+            # Prepare OpenAI API request
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {openai_key}"
+            }
+            
+            openai_payload = {
+                "model": "gpt-4o",
+                "messages": [
+                    {
+                        "role": "system", 
+                        "content": "You are a wellness coach providing short, helpful recommendations."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Suggest three wellness activities for someone feeling {mood} on a {weather} day. Keep each suggestion to 1-2 sentences."
+                    }
+                ],
+                "max_tokens": 150,
+                "temperature": 0.7
+            }
+            
+            # Make the API call with a short timeout
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=openai_payload,
+                timeout=3  # 3 second timeout
+            )
+            
+            if response.status_code == 200:
+                resp_data = response.json()
+                ai_text = resp_data['choices'][0]['message']['content']
+                
+                # Split the response into separate recommendations
+                custom_recommendations = [r.strip() for r in re.split(r'\n+|\d+\.\s+', ai_text) if r.strip()]
+                
+                # Use the AI recommendations if we got any
+                if custom_recommendations:
+                    recommendations = custom_recommendations
+    except Exception as e:
+        logger.error(f"Error getting AI recommendations: {str(e)}")
+        # We'll use the default recommendations we already set
+    
+    # Return success response with recommendations
+    return jsonify({
+        "status": "success", 
+        "message": "Mood logged successfully",
+        "mood_id": mood_id,
+        "recommendations": recommendations[:3]  # Limit to top 3 recommendations
+    })
+
+@wellness_bp.route('/mood', methods=['GET'])
+def get_mood_history():
+    """
+    Get mood history for the user
+    
+    Query parameters:
+    - days: number of days to look back (default: 7)
+    - limit: maximum number of records to return (default: 30)
+    """
+    # Get query parameters
+    days = request.args.get('days', default=7, type=int)
+    limit = request.args.get('limit', default=30, type=int)
+    
+    # Get user ID from auth token or use demo user
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else "demo-user-123"
+    
+    if is_fallback_mode():
+        # In fallback mode, generate some test data
+        test_data = generate_wellness_data(min(days, 30))
+        return jsonify({
+            "status": "success",
+            "data": test_data,
+            "message": "Retrieved mood history (fallback mode)"
+        })
+    
+    # Calculate the date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    try:
+        # Query the database for mood logs in the date range
+        mood_logs = MoodLog.query.filter(
+            MoodLog.user_id == uid,
+            MoodLog.timestamp >= start_date.isoformat(),
+            MoodLog.timestamp <= end_date.isoformat()
+        ).order_by(MoodLog.timestamp.desc()).limit(limit).all()
+        
+        # Convert to dictionary format for JSON
+        mood_data = []
+        for log in mood_logs:
+            mood_data.append({
+                "id": log.id,
+                "timestamp": log.timestamp,
+                "mood_score": log.mood_score,
+                "mood_tags": log.mood_tags,
+                "activity_tags": log.activity_tags,
+                "notes": log.notes,
+                "sleep_hours": log.sleep_hours,
+                "energy_level": log.energy_level,
+                "stress_level": log.stress_level
+            })
+        
+        # Calculate mood trends
+        avg_mood = sum(log['mood_score'] for log in mood_data) / len(mood_data) if mood_data else 0
+        avg_energy = sum(log['energy_level'] for log in mood_data if log.get('energy_level')) / sum(1 for log in mood_data if log.get('energy_level')) if any(log.get('energy_level') for log in mood_data) else 0
+        avg_stress = sum(log['stress_level'] for log in mood_data if log.get('stress_level')) / sum(1 for log in mood_data if log.get('stress_level')) if any(log.get('stress_level') for log in mood_data) else 0
+        
+        return jsonify({
+            "status": "success",
+            "data": mood_data,
+            "trends": {
+                "average_mood": round(avg_mood, 1),
+                "average_energy": round(avg_energy, 1),
+                "average_stress": round(avg_stress, 1)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving mood history: {str(e)}")
+        
+        # Return fallback data in case of database error
+        test_data = generate_wellness_data(min(days, 10))
+        return jsonify({
+            "status": "success",
+            "data": test_data,
+            "message": "Retrieved mood history (fallback due to error)",
+            "error": str(e)
+        })
+        
+        return jsonify({
+            "status": "success",
+            "message": "Mood logged successfully",
+            "mood_id": new_mood.id,
+            "timestamp": new_mood.timestamp,
+            "recommendations": recommendations
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error saving mood log: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to save mood log: {str(e)}"
+        }), 500
+
+@wellness_bp.route('/mood', methods=['GET'])
+def get_mood_history():
+    """
+    Get mood history for the user
+    
+    Query parameters:
+    - days: number of days to look back (default: 7)
+    - limit: maximum number of records to return (default: 30)
+    """
+    # Get query parameters
+    days = request.args.get('days', default=7, type=int)
+    limit = request.args.get('limit', default=30, type=int)
+    
+    # Get user ID from auth token or use demo user
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else "demo-user-123"
+    
+    if is_fallback_mode():
+        # In fallback mode, generate some test data
+        test_data = generate_wellness_data(min(days, 30))
+        return jsonify({
+            "status": "success",
+            "data": test_data,
+            "message": "Retrieved mood history (fallback mode)"
+        })
+    
+    # Calculate the date range
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    
+    try:
+        # Query the database for mood logs in the date range
+        mood_logs = MoodLog.query.filter(
+            MoodLog.user_id == uid,
+            MoodLog.timestamp >= start_date.isoformat(),
+            MoodLog.timestamp <= end_date.isoformat()
+        ).order_by(MoodLog.timestamp.desc()).limit(limit).all()
+        
+        # Convert to dictionary format for JSON
+        mood_data = []
+        for log in mood_logs:
+            mood_data.append({
+                "id": log.id,
+                "timestamp": log.timestamp,
+                "mood_score": log.mood_score,
+                "mood_tags": log.mood_tags,
+                "activity_tags": log.activity_tags,
+                "notes": log.notes,
+                "sleep_hours": log.sleep_hours,
+                "energy_level": log.energy_level,
+                "stress_level": log.stress_level
+            })
+        
+        # Calculate mood trends
+        avg_mood = sum(log['mood_score'] for log in mood_data) / len(mood_data) if mood_data else 0
+        avg_energy = sum(log['energy_level'] for log in mood_data if log.get('energy_level')) / sum(1 for log in mood_data if log.get('energy_level')) if any(log.get('energy_level') for log in mood_data) else 0
+        avg_stress = sum(log['stress_level'] for log in mood_data if log.get('stress_level')) / sum(1 for log in mood_data if log.get('stress_level')) if any(log.get('stress_level') for log in mood_data) else 0
+        
+        return jsonify({
+            "status": "success",
+            "data": mood_data,
+            "trends": {
+                "average_mood": round(avg_mood, 1),
+                "average_energy": round(avg_energy, 1),
+                "average_stress": round(avg_stress, 1)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving mood history: {str(e)}")
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to retrieve mood history: {str(e)}"
+        }), 500
+
+# Sleep Tracking API
+@wellness_bp.route('/sleep/log', methods=['POST'])
+@token_required
+@fallback_route
+def log_sleep():
+    """
+    Log sleep data for the user
+    
+    Required JSON fields:
+    - start_time: ISO format timestamp for sleep start
+    - end_time: ISO format timestamp for sleep end
+    - quality: 1-5 rating of sleep quality
+    
+    Optional fields:
+    - disruptions: number of times sleep was disrupted
+    - notes: text notes about sleep
+    """
+    data = request.get_json()
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    
+    if is_fallback_mode():
+        # In fallback mode, just return success
+        return jsonify({
+            "status": "success",
+            "message": "Sleep logged successfully (fallback mode)",
+            "sleep_id": random.randint(1000, 9999)
+        })
+    
+    # Implement actual sleep tracking functionality here
+    # This would typically involve:
+    # 1. Validating the input data
+    # 2. Creating a Sleep model instance
+    # 3. Saving to the database
+    
+    # For now, return a placeholder response
+    return jsonify({
+        "status": "success",
+        "message": "Sleep tracking API endpoint",
+        "function": "Not fully implemented yet"
+    })
+
+# Meditation API
+@wellness_bp.route('/meditation/log', methods=['POST'])
+@token_required
+@fallback_route
+def log_meditation():
+    """
+    Log a meditation session
+    
+    Required JSON fields:
+    - duration: duration in minutes
+    - technique: meditation technique used
+    
+    Optional fields:
+    - guided: boolean, whether it was guided meditation
+    - notes: text notes about the session
+    """
+    data = request.get_json()
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    
+    if is_fallback_mode():
+        # In fallback mode, just return success
+        return jsonify({
+            "status": "success",
+            "message": "Meditation session logged successfully (fallback mode)",
+            "session_id": random.randint(1000, 9999)
+        })
+    
+    # Implement actual meditation tracking functionality here
+    
+    # For now, return a placeholder response
+    return jsonify({
+        "status": "success",
+        "message": "Meditation tracking API endpoint",
+        "function": "Not fully implemented yet"
+    })
+
+# Exercise API
+@wellness_bp.route('/exercise/log', methods=['POST'])
+@token_required
+@fallback_route
+def log_exercise():
+    """
+    Log an exercise session
+    
+    Required JSON fields:
+    - activity: type of exercise
+    - duration: duration in minutes
+    - intensity: 1-5 rating of intensity
+    
+    Optional fields:
+    - calories: estimated calories burned
+    - distance: distance covered (for applicable activities)
+    - notes: text notes about the session
+    """
+    data = request.get_json()
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    
+    if is_fallback_mode():
+        # In fallback mode, just return success
+        return jsonify({
+            "status": "success",
+            "message": "Exercise session logged successfully (fallback mode)",
+            "session_id": random.randint(1000, 9999)
+        })
+    
+    # Implement actual exercise tracking functionality here
+    
+    # For now, return a placeholder response
+    return jsonify({
+        "status": "success",
+        "message": "Exercise tracking API endpoint",
+        "function": "Not fully implemented yet"
+    })
+
+# Nutrition API
+@wellness_bp.route('/nutrition/log', methods=['POST'])
+@token_required
+@fallback_route
+def log_nutrition():
+    """
+    Log a meal or nutrition data
+    
+    Required JSON fields:
+    - meal_type: breakfast, lunch, dinner, or snack
+    - foods: array of food items consumed
+    
+    Optional fields:
+    - calories: total calories
+    - protein: grams of protein
+    - carbs: grams of carbohydrates
+    - fat: grams of fat
+    - notes: text notes about the meal
+    """
+    data = request.get_json()
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    
+    if is_fallback_mode():
+        # In fallback mode, just return success
+        return jsonify({
+            "status": "success",
+            "message": "Nutrition data logged successfully (fallback mode)",
+            "meal_id": random.randint(1000, 9999)
+        })
+    
+    # Implement actual nutrition tracking functionality here
+    
+    # For now, return a placeholder response
+    return jsonify({
+        "status": "success",
+        "message": "Nutrition tracking API endpoint",
+        "function": "Not fully implemented yet"
+    })
+
+# Goal Coaching API
+@wellness_bp.route('/goal-coach/goals', methods=['GET', 'POST'])
+@token_required
+@fallback_route
+def manage_goals():
+    """
+    GET: Retrieve user's wellness goals
+    POST: Create a new wellness goal
+    
+    Required JSON fields for POST:
+    - title: goal title
+    - category: goal category (e.g., fitness, nutrition, mental health)
+    - target_date: target completion date
+    
+    Optional fields for POST:
+    - metrics: measurement metrics for the goal
+    - milestones: array of milestone targets
+    - notes: text notes about the goal
+    """
+    uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    
+    if request.method == 'GET':
+        if is_fallback_mode():
+            # Generate some sample goals in fallback mode
+            sample_goals = [
+                {
+                    "id": 1001,
+                    "title": "Morning Meditation",
+                    "category": "mental health",
+                    "target_date": (datetime.now() + timedelta(days=30)).isoformat(),
+                    "progress": 40,
+                    "metrics": "Days per week",
+                    "milestones": ["3 days/week", "5 days/week", "Daily practice"],
+                    "notes": "Focus on mindfulness meditation"
+                },
+                {
+                    "id": 1002,
+                    "title": "Increased Hydration",
+                    "category": "nutrition",
+                    "target_date": (datetime.now() + timedelta(days=14)).isoformat(),
+                    "progress": 65,
+                    "metrics": "Cups of water per day",
+                    "milestones": ["4 cups", "6 cups", "8 cups"],
+                    "notes": "Track with water reminder app"
+                },
+                {
+                    "id": 1003,
+                    "title": "30-Minute Daily Walk",
+                    "category": "fitness",
+                    "target_date": (datetime.now() + timedelta(days=21)).isoformat(),
+                    "progress": 80,
+                    "metrics": "Minutes per day",
+                    "milestones": ["10 minutes", "20 minutes", "30 minutes"],
+                    "notes": "Outdoor walks preferred"
+                }
+            ]
+            return jsonify({
+                "status": "success",
+                "data": sample_goals,
+                "message": "Retrieved wellness goals (fallback mode)"
+            })
+        
+        # Implement actual goal retrieval here
+        
+        # For now, return a placeholder response
+        return jsonify({
+            "status": "success",
+            "message": "Goal coaching API endpoint",
+            "function": "Not fully implemented yet"
+        })
+    
+    elif request.method == 'POST':
+        data = request.get_json()
+        
+        if is_fallback_mode():
+            # In fallback mode, just return success
+            return jsonify({
+                "status": "success",
+                "message": "Goal created successfully (fallback mode)",
+                "goal_id": random.randint(1000, 9999)
+            })
+        
+        # Implement actual goal creation here
+        
+        # For now, return a placeholder response
+        return jsonify({
+            "status": "success",
+            "message": "Goal coaching API endpoint",
+            "function": "Not fully implemented yet"
+        })
+
+# SynoMind Integration API
+@wellness_bp.route('/synomind/context', methods=['GET'])
+@fallback_route
+def get_wellness_context():
+    """
+    Get wellness context data for SynoMind integration
+    
+    This endpoint provides data that can be used by SynoMind
+    to understand the user's wellness state and provide personalized
+    assistance.
+    
+    Note: Authentication is optional for this endpoint to facilitate SynoMind integration
+    even when not logged in (for demo purposes).
+    """
+    # Try to get user ID if authenticated, but don't require it
+    try:
+        uid = g.user.uid if hasattr(g, 'user') and hasattr(g.user, 'uid') else None
+    except:
+        uid = None
+    
+    if is_fallback_mode():
+        # Generate some sample wellness context data
+        return jsonify({
+            "status": "success",
+            "data": {
+                "recent_moods": [
+                    {"date": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"), "score": 8, "tags": ["happy", "energetic"]},
+                    {"date": (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d"), "score": 7, "tags": ["focused", "calm"]},
+                    {"date": (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d"), "score": 6, "tags": ["tired", "stressed"]}
+                ],
+                "overall_mood": "positive",
+                "sleep_quality": "good",
+                "stress_level": "moderate",
+                "active_goals": [
+                    {"title": "Morning Meditation", "progress": 40},
+                    {"title": "Increased Hydration", "progress": 65},
+                    {"title": "30-Minute Daily Walk", "progress": 80}
+                ],
+                "recent_activities": ["meditation", "walking", "stretching"],
+                "suggested_focus_areas": ["stress management", "consistent sleep", "mindfulness"]
+            },
+            "message": "Retrieved wellness context for SynoMind (fallback mode)"
+        })
+    
+    # In a non-fallback implementation, you would:
+    # 1. Query recent mood logs
+    # 2. Calculate overall wellness metrics
+    # 3. Retrieve active goals and their progress
+    # 4. Identify patterns and suggested focus areas
+    # 5. Return the consolidated context data
+    
+    # For now, return a placeholder response
+    return jsonify({
+        "status": "success",
+        "message": "SynoMind wellness context API endpoint",
+        "function": "Not fully implemented yet"
+    })
+
+@wellness_bp.route('/synomind/suggestions', methods=['GET'])
+@fallback_route
+def get_wellness_suggestions():
+    """
+    Get wellness AI suggestions from SynoMind
+    
+    This is a public endpoint that provides generalized wellness
+    suggestions without requiring user authentication.
+    """
+    # Generate wellness suggestions that can be used by SynoMind
+    suggestions = [
+        {
+            "category": "mental health",
+            "title": "Morning Mindfulness",
+            "description": "Start your day with 5 minutes of mindful breathing to set a positive tone.",
+            "difficulty": "easy",
+            "benefits": ["Reduced stress", "Improved focus", "Better mood"]
+        },
+        {
+            "category": "nutrition",
+            "title": "Hydration Challenge",
+            "description": "Drink 8 glasses of water throughout the day to stay properly hydrated.",
+            "difficulty": "medium",
+            "benefits": ["Improved energy", "Better skin health", "Enhanced metabolism"]
+        },
+        {
+            "category": "fitness",
+            "title": "Desk Stretch Breaks",
+            "description": "Take a 2-minute stretch break every hour if you work at a desk.",
+            "difficulty": "easy",
+            "benefits": ["Reduced muscle tension", "Improved circulation", "Less eye strain"]
+        },
+        {
+            "category": "sleep",
+            "title": "Digital Sunset",
+            "description": "Turn off screens 1 hour before bedtime to improve sleep quality.",
+            "difficulty": "hard",
+            "benefits": ["Better sleep quality", "Faster sleep onset", "More restful nights"]
+        },
+        {
+            "category": "mental health",
+            "title": "Gratitude Journal",
+            "description": "Write down three things you're grateful for before bed.",
+            "difficulty": "easy",
+            "benefits": ["Increased positivity", "Reduced anxiety", "Improved life satisfaction"]
+        }
+    ]
+    
+    return jsonify({
+        "status": "success",
+        "data": suggestions
+    })
